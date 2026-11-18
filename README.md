@@ -25,6 +25,9 @@ git subinit                  # instead of: git submodule update --init
 └── github.com/<owner>/<repo>.git    # bare mirrors, one per upstream repo
 ```
 
+`~/gitcache` is a git repo that tracks only `README.md`, `bin/`, `sources` and
+`.gitignore`. The mirrors, logs and lock are ignored.
+
 The mirror path comes from the submodule URL, so the URL variants
 `git@github.com:Org/Repo.git`, `https://github.com/Org/Repo` and
 `ssh://git@github.com/Org/Repo.git` all map to
