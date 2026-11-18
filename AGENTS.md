@@ -132,8 +132,10 @@ launchctl print gui/$(id -u)/com.user.gitcache-sync | grep -E 'state|last exit'
   Two operations are safe: `git --git-dir=<mirror> refs migrate --ref-format=reftable`
   and adding new mirrors.
 - Don't add `url.*.insteadOf` rules to global git config unless the user asks.
-- The mirrors include private BuddyTV repos. Don't push this repo or the
-  mirrors anywhere, and don't add a remote unless the user asks.
+- The mirrors include private BuddyTV repos. This repo's `origin` is the
+  **public** GitHub repo `pavel-m-vizio/gitcache`. Only the tracked files go
+  there: never commit mirrors, logs, credentials, or private source code, and
+  keep `.gitignore`'s `/*` rule.
 
 ## Commits
 
