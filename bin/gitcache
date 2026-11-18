@@ -64,7 +64,7 @@ add_one() {
     # even ones that become unreachable after a force-push/branch deletion.
     git --git-dir="$tmp" config gc.pruneExpire never
     git --git-dir="$tmp" config gc.cruftPacks true
-    log "clone $url -> ${dir#$GITCACHE_ROOT/}"
+    log "clone $url -> ${dir#"$GITCACHE_ROOT"/}"
     if ! git --git-dir="$tmp" fetch -q --prune origin; then
         rm -rf "$tmp"; echo "FAILED: $url" >&2; return 1
     fi
@@ -135,7 +135,7 @@ cmd_fetch_one() {
         out="$(git --git-dir="$1" remote update --prune 2>&1 >/dev/null)" && return 0
         sleep $((attempt * 10))
     done
-    echo "$(date '+%Y-%m-%d %H:%M:%S') FETCH FAILED ${1#$GITCACHE_ROOT/}: $(echo "$out" | tail -n 2 | tr '\n' ' ')"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') FETCH FAILED ${1#"$GITCACHE_ROOT"/}: $(echo "$out" | tail -n 2 | tr '\n' ' ')"
 }
 
 cmd_submodule_update() {
@@ -146,6 +146,8 @@ cmd_submodule_update() {
     [ -f .gitmodules ] || { echo "no .gitmodules in $top"; return 0; }
     # Serial init first: it writes the (shared) .git/config.
     git submodule --quiet init -- "$@" || return 1
+    # The xargs 'sh -c' script below expands its own arguments.
+    # shellcheck disable=SC2016
     git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
         while read -r name path; do
             if [ $# -gt 0 ]; then
