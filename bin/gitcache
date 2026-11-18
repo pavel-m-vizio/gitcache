@@ -1,0 +1,181 @@
+#!/bin/bash
+# gitcache: local bare mirrors of upstream repos, used as --reference objects
+# stores so submodule clones (e.g. in new worktrees) don't hit the network.
+#
+#   gitcache add <url>...             create mirrors for the given URLs
+#   gitcache add-from <superproject>  mirror every submodule of a repo (and its
+#                                     worktrees); remembers it for future syncs
+#   gitcache sync                     add new submodules, fetch all mirrors
+#   gitcache path <url>               print the mirror directory for a URL
+#   gitcache list                     list mirrors
+#   gitcache submodule-update [--dissociate] [path...]
+#                                     run inside a superproject/worktree:
+#                                     init + clone submodules using the mirrors
+set -u
+
+GITCACHE_ROOT="${GITCACHE_ROOT:-$HOME/gitcache}"
+JOBS="${GITCACHE_JOBS:-8}"
+SOURCES="$GITCACHE_ROOT/sources"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+# Never prompt (launchd has no tty) and never hang forever on a dead connection.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4}"
+export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+die() { echo "gitcache: $*" >&2; exit 1; }
+
+# git@github.com:Org/Repo(.git), https://github.com/Org/Repo(.git),
+# ssh://git@host:22/Org/Repo  ->  $GITCACHE_ROOT/<host>/Org/Repo.git
+mirror_path() {
+    local u="$1" rest host path
+    u="${u%/}"; u="${u%.git}"
+    case "$u" in
+        *://*) rest="${u#*://}"; rest="${rest#*@}"
+               host="${rest%%/*}"; path="${rest#*/}"; host="${host%%:*}" ;;
+        *:*)   rest="${u#*@}"; host="${rest%%:*}"; path="${rest#*:}" ;;
+        *)     return 1 ;;
+    esac
+    [ -n "$host" ] && [ -n "$path" ] && [ "$path" != "$rest" ] || return 1
+    case "/$path/" in */../*|*/./*) return 1 ;; esac
+    echo "$GITCACHE_ROOT/$host/$path.git"
+}
+
+list_mirrors() {
+    [ -d "$GITCACHE_ROOT" ] || return 0
+    find "$GITCACHE_ROOT" -mindepth 3 -type d -name '*.git' -prune -print 2>/dev/null |
+        while read -r d; do [ -f "$d/HEAD" ] && echo "$d"; done | sort
+}
+
+add_one() {
+    local url="$1" dir tmp head
+    dir="$(mirror_path "$url")" || { echo "skip (unsupported url): $url" >&2; return 0; }
+    [ -d "$dir" ] && return 0
+    mkdir -p "$(dirname "$dir")"
+    tmp="$dir.tmp.$$"
+    rm -rf "$tmp"
+    git init -q --bare --ref-format=reftable "$tmp" || return 1
+    # Mirror branches and tags only; refs/pull/* would bloat the cache for no gain.
+    git --git-dir="$tmp" config remote.origin.url "$url"
+    git --git-dir="$tmp" config remote.origin.fetch '+refs/heads/*:refs/heads/*'
+    git --git-dir="$tmp" config --add remote.origin.fetch '+refs/tags/*:refs/tags/*'
+    # Clones borrow objects from here via alternates: never delete objects,
+    # even ones that become unreachable after a force-push/branch deletion.
+    git --git-dir="$tmp" config gc.pruneExpire never
+    git --git-dir="$tmp" config gc.cruftPacks true
+    log "clone $url -> ${dir#$GITCACHE_ROOT/}"
+    if ! git --git-dir="$tmp" fetch -q --prune origin; then
+        rm -rf "$tmp"; echo "FAILED: $url" >&2; return 1
+    fi
+    head="$(git ls-remote --symref "$url" HEAD 2>/dev/null | sed -n 's/^ref: \(refs\/heads\/[^[:space:]]*\).*/\1/p')"
+    [ -n "$head" ] && git --git-dir="$tmp" symbolic-ref HEAD "$head"
+    mv "$tmp" "$dir"
+}
+
+# Submodule URLs of a superproject: its own .gitmodules plus every worktree's.
+submodule_urls() {
+    local sp="$1" wt
+    git -C "$sp" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
+        while read -r wt; do
+            [ -f "$wt/.gitmodules" ] && git config -f "$wt/.gitmodules" --get-regexp '^submodule\..*\.url$' | awk '{print $2}'
+        done | sort -u
+}
+
+cmd_add() {
+    local rc=0 u
+    for u in "$@"; do add_one "$u" || rc=1; done
+    return $rc
+}
+
+cmd_add_from() {
+    local sp rc=0
+    [ $# -ge 1 ] || die "usage: gitcache add-from <superproject>..."
+    touch "$SOURCES"
+    for sp in "$@"; do
+        sp="$(git -C "$sp" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || die "not a git repo: $sp"
+        sp="${sp%/.git}"
+        grep -qxF "$sp" "$SOURCES" || echo "$sp" >> "$SOURCES"
+        # Clone new mirrors in parallel.
+        submodule_urls "$sp" | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
+    done
+    return $rc
+}
+
+cmd_sync() {
+    local sp rc=0 start fails
+    lock="$GITCACHE_ROOT/.sync.lock"
+    mkdir -p "$GITCACHE_ROOT"
+    if ! mkdir "$lock" 2>/dev/null; then
+        if kill -0 "$(cat "$lock/pid" 2>/dev/null)" 2>/dev/null; then
+            log "sync already running (pid $(cat "$lock/pid")), skipping"; return 0
+        fi
+        rm -rf "$lock"; mkdir "$lock" || die "cannot take lock $lock"
+    fi
+    echo $$ > "$lock/pid"
+    trap 'rm -rf "$lock"' EXIT
+    start=$(date +%s)
+
+    if [ -f "$SOURCES" ]; then
+        while read -r sp; do
+            [ -n "$sp" ] && [ -d "$sp" ] || continue
+            submodule_urls "$sp" | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
+        done < "$SOURCES"
+    fi
+
+    fails="$(list_mirrors | xargs -P "$JOBS" -n 1 "$SELF" _fetch-one)"
+    [ -n "$fails" ] && { echo "$fails"; rc=1; }
+    log "sync done: $(list_mirrors | wc -l | tr -d ' ') mirrors, $(( $(date +%s) - start ))s, $( [ $rc = 0 ] && echo ok || echo 'with errors')"
+    return $rc
+}
+
+cmd_fetch_one() {
+    local out attempt
+    for attempt in 1 2 3; do
+        out="$(git --git-dir="$1" remote update --prune 2>&1 >/dev/null)" && return 0
+        sleep $((attempt * 10))
+    done
+    echo "$(date '+%Y-%m-%d %H:%M:%S') FETCH FAILED ${1#$GITCACHE_ROOT/}: $(echo "$out" | tail -n 2 | tr '\n' ' ')"
+}
+
+cmd_submodule_update() {
+    local dissociate="" top name path url ref
+    [ "${1:-}" = "--dissociate" ] && { dissociate="--dissociate"; shift; }
+    top="$(git rev-parse --show-toplevel)" || die "not inside a git work tree"
+    cd "$top" || exit 1
+    [ -f .gitmodules ] || { echo "no .gitmodules in $top"; return 0; }
+    # Serial init first: it writes the (shared) .git/config.
+    git submodule --quiet init -- "$@" || return 1
+    git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+        while read -r name path; do
+            if [ $# -gt 0 ]; then
+                case " $* " in *" $path "*|*" $path/ "*) ;; *) continue ;; esac
+            fi
+            name="${name#submodule.}"; name="${name%.path}"
+            url="$(git config "submodule.$name.url" || git config -f .gitmodules "submodule.$name.url")"
+            ref="$(mirror_path "$url")" || ref=""
+            [ -n "$ref" ] && [ -d "$ref" ] || ref=""
+            printf '%s\0%s\0' "$path" "$ref"
+        done |
+        GITCACHE_DISSOCIATE="$dissociate" xargs -0 -n 2 -P "$JOBS" sh -c '
+            p="$1"; r="$2"
+            if [ -n "$r" ]; then
+                git submodule --quiet update --reference "$r" $GITCACHE_DISSOCIATE -- "$p"
+            else
+                echo "gitcache: no mirror for $p, cloning from upstream" >&2
+                git submodule --quiet update -- "$p"
+            fi || { echo "gitcache: FAILED $p" >&2; exit 1; }
+        ' sh
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+    add)               cmd_add "$@" ;;
+    add-from)          cmd_add_from "$@" ;;
+    sync)              cmd_sync ;;
+    _fetch-one)        cmd_fetch_one "$1" ;;
+    path)              mirror_path "$1" || die "unsupported url: $1" ;;
+    list)              list_mirrors ;;
+    submodule-update)  cmd_submodule_update "$@" ;;
+    *)                 sed -n '2,15s/^# \{0,1\}//p' "$SELF"; [ -z "$cmd" ] || [ "$cmd" = help ] || [ "$cmd" = -h ] || exit 2 ;;
+esac

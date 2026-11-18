@@ -1,0 +1,6 @@
+# Track only the tool and its config; mirrors, logs and locks stay untracked.
+/*
+!/.gitignore
+!/README.md
+!/bin/
+!/sources
