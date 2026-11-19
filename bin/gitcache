@@ -8,9 +8,10 @@
 #   gitcache sync                     add new submodules, fetch all mirrors
 #   gitcache path <url>               print the mirror directory for a URL
 #   gitcache list                     list mirrors
-#   gitcache submodule-update [--dissociate] [path...]
+#   gitcache submodule-update [--dissociate] [--no-recursive] [path...]
 #                                     run inside a superproject/worktree:
-#                                     init + clone submodules using the mirrors
+#                                     init + clone submodules (recursively)
+#                                     using the mirrors
 set -u
 
 GITCACHE_ROOT="${GITCACHE_ROOT:-$HOME/gitcache}"
@@ -65,20 +66,50 @@ add_one() {
     git --git-dir="$tmp" config gc.pruneExpire never
     git --git-dir="$tmp" config gc.cruftPacks true
     log "clone $url -> ${dir#"$GITCACHE_ROOT"/}"
-    if ! git --git-dir="$tmp" fetch -q --prune origin; then
-        rm -rf "$tmp"; echo "FAILED: $url" >&2; return 1
-    fi
+    local attempt
+    for attempt in 1 2 3 0; do
+        [ "$attempt" = 0 ] && { rm -rf "$tmp"; echo "FAILED: $url" >&2; return 1; }
+        git --git-dir="$tmp" fetch -q --prune origin && break
+        sleep $((attempt * 10))
+    done
     head="$(git ls-remote --symref "$url" HEAD 2>/dev/null | sed -n 's/^ref: \(refs\/heads\/[^[:space:]]*\).*/\1/p')"
     [ -n "$head" ] && git --git-dir="$tmp" symbolic-ref HEAD "$head"
-    mv "$tmp" "$dir"
+    # mv into an existing directory would nest the repo inside it.
+    if [ -e "$dir" ]; then rm -rf "$tmp"; else mv "$tmp" "$dir"; fi
 }
 
-# Submodule URLs of a superproject: its own .gitmodules plus every worktree's.
+# Drop URLs that map to an already-seen mirror (case-insensitive, like APFS),
+# so parallel adds never race on the same directory.
+unique_urls() {
+    local url key seen="|"
+    while read -r url; do
+        key="$(mirror_path "$url" | tr '[:upper:]' '[:lower:]')" || key="$url"
+        case "$seen" in *"|$key|"*) continue ;; esac
+        seen="$seen$key|"
+        echo "$url"
+    done
+}
+
+# Submodule URLs of a superproject: every .gitmodules (including nested ones in
+# checked-out submodules) of the superproject and of all its worktrees.
 submodule_urls() {
-    local sp="$1" wt
+    local sp="$1" wt gm dir key name url
     git -C "$sp" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' |
         while read -r wt; do
-            [ -f "$wt/.gitmodules" ] && git config -f "$wt/.gitmodules" --get-regexp '^submodule\..*\.url$' | awk '{print $2}'
+            git -C "$wt" ls-files -z --recurse-submodules -- ':(glob)**/.gitmodules' 2>/dev/null |
+                while IFS= read -r -d '' gm; do
+                    [ -f "$wt/$gm" ] || continue
+                    dir="$(dirname "$wt/$gm")"
+                    git config -f "$wt/$gm" --get-regexp '^submodule\..*\.url$' |
+                        while read -r key url; do
+                            case "$url" in
+                                ./*|../*)   # relative: use the URL git resolved at init
+                                    name="${key#submodule.}"; name="${name%.url}"
+                                    url="$(git -C "$dir" config "submodule.$name.url")" || continue ;;
+                            esac
+                            echo "$url"
+                        done
+                done
         done | sort -u
 }
 
@@ -97,7 +128,7 @@ cmd_add_from() {
         sp="${sp%/.git}"
         grep -qxF "$sp" "$SOURCES" || echo "$sp" >> "$SOURCES"
         # Clone new mirrors in parallel.
-        submodule_urls "$sp" | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
+        submodule_urls "$sp" | unique_urls | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
     done
     return $rc
 }
@@ -119,7 +150,7 @@ cmd_sync() {
     if [ -f "$SOURCES" ]; then
         while read -r sp; do
             [ -n "$sp" ] && [ -d "$sp" ] || continue
-            submodule_urls "$sp" | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
+            submodule_urls "$sp" | unique_urls | xargs -P "$JOBS" -n 1 "$SELF" add || rc=1
         done < "$SOURCES"
     fi
 
@@ -138,16 +169,11 @@ cmd_fetch_one() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') FETCH FAILED ${1#"$GITCACHE_ROOT"/}: $(echo "$out" | tail -n 2 | tr '\n' ' ')"
 }
 
-cmd_submodule_update() {
-    local dissociate="" top name path url ref
-    [ "${1:-}" = "--dissociate" ] && { dissociate="--dissociate"; shift; }
-    top="$(git rev-parse --show-toplevel)" || die "not inside a git work tree"
-    cd "$top" || exit 1
-    [ -f .gitmodules ] || { echo "no .gitmodules in $top"; return 0; }
-    # Serial init first: it writes the (shared) .git/config.
-    git submodule --quiet init -- "$@" || return 1
-    # The xargs 'sh -c' script below expands its own arguments.
-    # shellcheck disable=SC2016
+# "<path>\t<mirror or ->" for each submodule of the current superproject,
+# limited to the given paths if any. (A function, because bash 3.2 can't
+# parse `case` inside `$(...)`.)
+selected_submodules() {
+    local name path url ref
     git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
         while read -r name path; do
             if [ $# -gt 0 ]; then
@@ -156,18 +182,57 @@ cmd_submodule_update() {
             name="${name#submodule.}"; name="${name%.path}"
             url="$(git config "submodule.$name.url" || git config -f .gitmodules "submodule.$name.url")"
             ref="$(mirror_path "$url")" || ref=""
-            [ -n "$ref" ] && [ -d "$ref" ] || ref=""
-            printf '%s\0%s\0' "$path" "$ref"
-        done |
+            [ -n "$ref" ] && [ -d "$ref" ] || ref="-"
+            printf '%s\t%s\n' "$path" "$ref"
+        done
+}
+
+cmd_submodule_update() {
+    local dissociate="" recursive=1 top path list rc=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dissociate)   dissociate="--dissociate"; shift ;;
+            --no-recursive) recursive=""; shift ;;
+            --)             shift; break ;;
+            -*)             die "unknown option: $1" ;;
+            *)              break ;;
+        esac
+    done
+    # Git aliases run with GIT_DIR etc. exported (always in worktrees); left
+    # set, they'd point nested submodule commands at the superproject.
+    # shellcheck disable=SC2046
+    unset $(git rev-parse --local-env-vars)
+    top="$(git rev-parse --show-toplevel)" || die "not inside a git work tree"
+    cd "$top" || exit 1
+    [ -f .gitmodules ] || { echo "no .gitmodules in $top"; return 0; }
+    # Serial init first: it writes the (shared) .git/config.
+    git submodule --quiet init -- "$@" || return 1
+    list="$(selected_submodules "$@")"
+    [ -n "$list" ] || return 0
+    # The xargs 'sh -c' script below expands its own arguments.
+    # shellcheck disable=SC2016
+    printf '%s\n' "$list" | tr '\t\n' '\0\0' |
         GITCACHE_DISSOCIATE="$dissociate" xargs -0 -n 2 -P "$JOBS" sh -c '
             p="$1"; r="$2"
-            if [ -n "$r" ]; then
+            if [ "$r" != - ]; then
                 git submodule --quiet update --reference "$r" $GITCACHE_DISSOCIATE -- "$p"
             else
                 echo "gitcache: no mirror for $p, cloning from upstream" >&2
                 git submodule --quiet update -- "$p"
             fi || { echo "gitcache: FAILED $p" >&2; exit 1; }
-        ' sh
+        ' sh || rc=1
+    if [ -n "$recursive" ]; then
+        printf '%s\n' "$list" | cut -f1 | {
+            failed=0
+            while read -r path; do
+                [ -f "$path/.gitmodules" ] || continue
+                ( cd "$path" && "$SELF" submodule-update ${dissociate:+"$dissociate"} ) ||
+                    { echo "gitcache: FAILED nested submodules of $path" >&2; failed=1; }
+            done
+            exit $failed
+        } || rc=1
+    fi
+    return $rc
 }
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift

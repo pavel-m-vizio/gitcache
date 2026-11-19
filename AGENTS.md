@@ -1,8 +1,9 @@
 # AGENTS.md — instructions for AI agents working in `~/gitcache`
 
 This repo is a small personal tool. It keeps local bare mirrors of the git
-submodules used by `~/projects/fancy-player`, so new worktrees can clone their
-submodules locally instead of from GitHub. `README.md` is the user-facing
+submodules, nested ones included, used by the superprojects listed in
+`sources` (`~/projects/fancy-player` and `~/projects/es-player`). New worktrees
+can then clone their submodules locally instead of from GitHub. `README.md` is the user-facing
 documentation; read it first.
 
 ## What is tracked
@@ -27,9 +28,11 @@ When you add a new tracked file at the top level, add a matching
   hourly and at load, with `ProcessType` set to `Standard`. **Don't change it
   to `Background`:** macOS then throttles the network and a sync goes from
   ~8 s to ~5 min.
-- `~/projects/fancy-player/.git/config` holds the alias
+- `~/projects/fancy-player/.git/config` and `~/projects/es-player/.git/config`
+  hold the alias
   `alias.subinit = !/Users/pavel.malyshev/gitcache/bin/gitcache submodule-update`.
-  All fancy-player worktrees share this config.
+  All of a repo's worktrees share its config. When adding a superproject with
+  `gitcache add-from`, add the alias to it as well.
 
 If you change the CLI, the paths or the scheduling, update `README.md`, and
 update these external files where they're affected.
@@ -71,6 +74,14 @@ update these external files where they're affected.
 - **Address bare repos with `git --git-dir=<mirror>`**, never with
   `git -C <mirror>`. With `safe.bareRepository=explicit`, git refuses
   `git -C <mirror>`.
+- bash 3.2 can't parse a `case` statement inside `$(...)`. Move such code
+  into a function and call the function from the command substitution
+  (see `selected_submodules`).
+- Git `!` aliases run with `GIT_DIR` (and similar) exported; in worktrees
+  this always happens. Code that runs git in other repos (nested
+  submodules) must first `unset $(git rev-parse --local-env-vars)`.
+- Several URL spellings can map to one mirror. Pass URL lists through
+  `unique_urls` before cloning in parallel.
 - `git submodule`'s `--quiet` goes **before** the subcommand
   (`git submodule --quiet update ...`).
 - Keep `set -u`-safe: initialize variables, and use `${1:-}` for optional
@@ -95,7 +106,7 @@ bash -n bin/gitcache && shellcheck bin/gitcache
 # URL mapping (expect identical paths for the first two):
 ./bin/gitcache path git@github.com:fmtlib/fmt.git
 ./bin/gitcache path https://github.com/fmtlib/fmt
-./bin/gitcache list | wc -l            # number of mirrors (72 as of creation)
+./bin/gitcache list | wc -l            # number of mirrors (77 as of 2026-11-19)
 ./bin/gitcache sync                    # expect "sync done: N mirrors, ~10s, ok"
 ```
 
@@ -115,6 +126,13 @@ git worktree remove --force --force ../fancy-player.worktrees/_gitcache-test
 git worktree prune
 ```
 
+Repeat the same steps in `~/projects/es-player` (worktrees go in
+`../es-player.worktrees/`). It has nested submodules 3 levels deep: expect
+`git submodule status --recursive` to list 9 clean entries after ~5 s, with
+`third_party/ipc/deps/vizio-log/deps/fmt` using the `fmtlib/fmt.git` mirror.
+Also run `git subinit` once from a subdirectory, which exercises the
+`GIT_DIR` handling.
+
 To test the LaunchAgent:
 
 ```sh
@@ -125,8 +143,11 @@ launchctl print gui/$(id -u)/com.user.gitcache-sync | grep -E 'state|last exit'
 
 ## Safety
 
-- Don't touch the user's real fancy-player worktrees. Only the throwaway
-  `_gitcache-test` worktree may be created and removed.
+- Don't touch the user's real worktrees. Only throwaway `_gitcache-test`
+  worktrees may be created and removed.
+- Never run `git submodule deinit` (or `submodule sync`) in a test worktree.
+  The `submodule.*` config is shared with the main checkout and every other
+  worktree. To retest, remove the test worktree and add a new one.
 - Don't run `git gc --prune=now`, `git repack -a -d` with pruning, or
   `rm -rf` on mirrors, and don't migrate them in a way that drops objects.
   Two operations are safe: `git --git-dir=<mirror> refs migrate --ref-format=reftable`

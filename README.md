@@ -1,17 +1,19 @@
 # gitcache — local mirror cache for git submodules
 
-Local bare mirrors of every submodule used by `~/projects/fancy-player`, kept
-fresh by a LaunchAgent. New worktrees clone their submodules from these
-mirrors instead of GitHub: ~64 submodules check out in ~12 s instead of
-minutes.
+Local bare mirrors of every submodule, including nested ones, used by the
+superprojects listed in `sources` (`~/projects/fancy-player` and
+`~/projects/es-player`). A LaunchAgent keeps them fresh. New worktrees clone
+their submodules from these mirrors instead of GitHub. In fancy-player, 64
+submodules check out in ~12 s instead of minutes; es-player's 9 submodules,
+nested 3 levels deep, take ~5 s.
 
 ## TL;DR
 
 ```sh
-cd ~/projects/fancy-player
+cd ~/projects/fancy-player          # or ~/projects/es-player
 git worktree add ../fancy-player.worktrees/my-branch -b my-branch
 cd ../fancy-player.worktrees/my-branch
-git subinit                  # instead of: git submodule update --init
+git subinit                  # instead of: git submodule update --init --recursive
 ```
 
 ## Layout
@@ -39,21 +41,21 @@ The mirror path comes from the submodule URL, so the URL variants
 | Command | What it does |
 |---|---|
 | `gitcache add <url>...` | Creates mirrors for the given URLs; skips any that already exist. |
-| `gitcache add-from <repo>` | Mirrors every submodule URL found in `.gitmodules` of the repo **and all of its worktrees**, and records the repo in `sources` so `sync` picks up new submodules later. |
+| `gitcache add-from <repo>` | Mirrors every submodule URL in every `.gitmodules` of the repo **and all of its worktrees**, including nested `.gitmodules` inside checked-out submodules. Records the repo in `sources`, so `sync` picks up new submodules later. |
 | `gitcache sync` | For each repo in `sources`: mirrors any new submodule URLs. Then runs `git remote update --prune` on every mirror (8 in parallel, 3 attempts each). |
 | `gitcache list` | Lists all mirrors. |
 | `gitcache path <url>` | Prints the mirror directory for a URL. |
-| `gitcache submodule-update [--dissociate] [path...]` | Run inside a superproject or worktree: `git submodule init`, then clones or updates each submodule using its mirror as `--reference` (8 in parallel). |
+| `gitcache submodule-update [--dissociate] [--no-recursive] [path...]` | Run inside a superproject or worktree: `git submodule init`, then clones or updates each submodule using its mirror as `--reference` (8 in parallel). Then does the same inside each submodule that has its own `.gitmodules`, unless you pass `--no-recursive`. |
 
 Environment overrides: `GITCACHE_ROOT` (default `~/gitcache`) and
 `GITCACHE_JOBS` (default `8`).
 
 ## The custom git command: `git subinit`
 
-`git subinit` is a **git alias** (not a built-in command), defined in
-fancy-player's repo-local config (`~/projects/fancy-player/.git/config`).
-All worktrees share that config, so the alias works in every fancy-player
-worktree, but nowhere else.
+`git subinit` is a **git alias** (not a built-in command), defined in the
+repo-local config of fancy-player and es-player (`<repo>/.git/config`).
+Worktrees share their repo's config, so the alias works in every worktree of
+those two repos, but nowhere else.
 
 ```ini
 [alias]
@@ -64,8 +66,9 @@ The leading `!` makes git run it as a shell command from the top of the
 worktree. Any arguments are passed through:
 
 ```sh
-git subinit                          # all submodules
-git subinit third_party/fmt          # only some paths
+git subinit                          # all submodules, recursively
+git subinit third_party/fmt          # only some top-level paths (and their nested submodules)
+git subinit --no-recursive           # top-level submodules only
 git subinit --dissociate             # copy objects in, don't depend on the cache
 ```
 
@@ -120,6 +123,12 @@ Plain `git submodule update --init` still works as before, but it does
    Git has no setting to give each submodule a different `--reference`
    repo, which is why the wrapper script and the alias exist.
 
+   Nested submodules are handled by running the same steps inside each
+   checked-out submodule that has a `.gitmodules`. Before it starts, the
+   script clears the `GIT_DIR`-style variables git exports to aliases
+   (`git rev-parse --local-env-vars`). Otherwise, git commands run inside a
+   nested submodule would act on the superproject.
+
 ## Alternative considered: `url.<base>.insteadOf`
 
 A global rule such as
@@ -164,8 +173,10 @@ gitcache add https://github.com/foo/bar.git     # cache a single repo
 du -sh ~/gitcache/github.com/*/* | sort -h      # disk usage per mirror
 ```
 
-New submodules added to fancy-player (on any branch checked out in a
-worktree) are mirrored automatically by the next sync. If a submodule has no
+New submodules added to a superproject in `sources` are mirrored
+automatically by the next sync. This includes submodules added on any branch
+that's checked out in a worktree, and nested submodules once their parent is
+checked out. If a submodule has no
 mirror yet, `git subinit` prints a message and clones it from GitHub.
 
 ## Troubleshooting
@@ -192,5 +203,6 @@ Make existing worktrees independent first (see above), then:
 launchctl bootout gui/$(id -u)/com.user.gitcache-sync
 rm ~/Library/LaunchAgents/com.user.gitcache-sync.plist
 git -C ~/projects/fancy-player config --unset alias.subinit
+git -C ~/projects/es-player config --unset alias.subinit
 rm -rf ~/gitcache
 ```
